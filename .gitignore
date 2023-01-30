@@ -1,0 +1,9 @@
+.env
+*.pkl
+nlp/results
+scraper/notes.txt
+.ipynb*
+*.pyc
+*.code-workspace
+*.log
+*.zip
