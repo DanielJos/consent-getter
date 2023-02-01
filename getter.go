@@ -22,7 +22,7 @@ type Event struct {
 	Site        string `json:"site"`
 	Key         string `json:"key"`
 	NumToGet    int    `json:"numtoget"`
-	APIEndpoint string `json:"apiendpoint"`
+	QueueEndpoint string `json:"queueendpoint"`
 }
 
 type DataResponseOut struct {
@@ -73,6 +73,116 @@ func addPageHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "text/html; charset=utf-8")
 }
 
+// Getter struct
+type Getter struct {
+	rmqConnection 	*amqp.Connection
+	rmqChannel    	*amqp.Channel
+	httpClient   	*http.Client
+}
+func (getter *Getter) Close() {
+	getter.rmqConnection.Close()
+}
+func (getter *Getter) Init(event Event) error {
+	log.Println("Initialising getter...")
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return fmt.Errorf("Unable to create cookie jar:", err)
+	}
+
+	getter.httpClient = &http.Client{
+		Jar: jar,
+	}
+
+	// Init RabbitMQ connection
+	log.Println("Connecting to RabbitMQ:", event.QueueEndpoint)
+	getter.rmqConnection, err = amqp.Dial(event.QueueEndpoint)
+	if err != nil {
+		log.Println("AMQP dial error:", err)
+		os.Exit(1)
+		return fmt.Errorf("AMQP dial error: %v", err)
+	}
+	getter.rmqChannel, err = getter.rmqConnection.Channel()
+	if err != nil {
+		log.Println("AMQP channel error: %v", err)
+		os.Exit(1)
+		return fmt.Errorf("AMQP channel error: %v", err)
+	}
+
+	log.Println("Getter initialised.")
+	return nil
+}
+
+func (getter *Getter) HandleArticle(outRes DataResponseOut, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	log.Println("Received article link:", outRes.Link)
+
+	// Get the article
+	req, err := http.NewRequest("GET", outRes.Link, nil)
+	if err != nil {
+		log.Println("Get request error:", err)
+		return
+	}
+
+	cookie := &http.Cookie{
+		Name:  "CONSENT",
+		Value: "YES+cb.20220403-18-p0.en+FX+489",
+	}
+
+	req.AddCookie(cookie)
+	addPageHeaders(req)
+
+	res, err := getter.httpClient.Do(req)
+	if err != nil {
+		log.Println("Do get request error:", err)
+		return
+	}
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	if err != nil {
+		log.Println("parse article html error:", err)
+		return
+	}
+
+	// Get the article title
+	doc.Find("head > title").First().Each(func(i int, s *goquery.Selection) {
+		title := s.Text()
+		log.Println("Title:", title)
+		outRes.PageTitle = title
+	})
+
+	res.Body.Close()
+
+	// Post the data
+	log.Println("Posting data:", outRes)
+
+	outJSON, err := outRes.String()
+	if err != nil {
+		log.Println("JSON to string error: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	log.Println("Posting data:", outRes.Headline)
+	err = getter.rmqChannel.PublishWithContext(ctx,
+		"consent.direct",
+		"datain",
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:"text/json",
+			Body:        []byte(outJSON),
+		},
+	)
+	if err != nil {
+		log.Printf("AMQP publish error: %v", err)
+		return
+	}
+}
+
 func waitGroupTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	c := make(chan struct{})
 	go func() {
@@ -87,124 +197,48 @@ func waitGroupTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	}
 }
 
-func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (string, error) {
+func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	log.Printf("Received request: %+v", request)
 	log.Println("Received request body:", request.Body)
 
 	fmt.Printf("%+v\n", request)
 
+	
 	event := Event{}
 	err := json.Unmarshal([]byte(request.Body), &event)
 	if err != nil {
 		log.Println("Unable to unmarshal event:", err)
-		return "", fmt.Errorf("Unable to unmarshal event:", err)
+		return events.APIGatewayProxyResponse{
+			StatusCode: 400,
+			Body:       "Unable to unmarshal event",
+		}, fmt.Errorf("Unable to unmarshal event:", err)
 	}
-
+	
 	// If any of the fields in the body are empty then return an error
-	if event.Site == "" || event.Key == "" || event.NumToGet == 0 || event.APIEndpoint == "" {
-		log.Println("Missing required fields in request body")
-		return "", fmt.Errorf("Missing required fields in request body")
+	if event.Site == "" || event.Key == "" || event.NumToGet == 0 || event.QueueEndpoint == "" {
+		log.Println("Missing required fields in request body. Request body:", request.Body)
+		log.Printf("event: %+v", event)
+		return events.APIGatewayProxyResponse{
+			StatusCode: 400,
+			Body:       "Missing required fields in request body" + request.Body,
+		}, fmt.Errorf("Missing required fields in request body: " + request.Body + " :finished")
 	}
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return "", fmt.Errorf("Unable to create cookie jar:", err)
-	}
+	// Init the getter
+	getter := Getter{}
+	getter.Init(event)
+	defer getter.Close()
 
-	client := &http.Client{
-		Jar: jar,
-	}
-
+	log.Println("Ready to start scraping")
+	
 	cookie := &http.Cookie{
 		Name:  "CONSENT",
 		Value: "YES+cb.20220403-18-p0.en+FX+489",
 	}
 
-	log.Println("Starting data handler...")
-
-	// Init RabbitMQ connection
-	conn, err := amqp.Dial(event.APIEndpoint)
-	if err != nil {
-		log.Println("AMQP dial error:", err)
-		os.Exit(1)
-		return "", fmt.Errorf("AMQP dial error: %v", err)
-	}
-	defer conn.Close()
-	mqchan, err := conn.Channel()
-	if err != nil {
-		log.Println("AMQP channel error: %v", err)
-		os.Exit(1)
-		return "", fmt.Errorf("AMQP channel error: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	log.Println("Ready to start scraping")
-
 	wg := sync.WaitGroup{}
 	// Handle the article links
-	handleArticle := func(outRes DataResponseOut, wg *sync.WaitGroup) {
-		defer wg.Done()
-
-		log.Println("Received article link:", outRes.Link)
-
-		// Get the article
-		req, err := http.NewRequest("GET", outRes.Link, nil)
-		if err != nil {
-			log.Println("Get request error:", err)
-			return
-		}
-		req.AddCookie(cookie)
-		addPageHeaders(req)
-
-		res, err := client.Do(req)
-		if err != nil {
-			log.Println("Do get request error:", err)
-			return
-		}
-
-		doc, err := goquery.NewDocumentFromReader(res.Body)
-		if err != nil {
-			log.Println("parse article html error:", err)
-			return
-		}
-
-		// Get the article title
-		doc.Find("head > title").First().Each(func(i int, s *goquery.Selection) {
-			title := s.Text()
-			log.Println("Title:", title)
-			outRes.PageTitle = title
-		})
-
-		res.Body.Close()
-
-		// Post the data
-		log.Println("Posting data:", outRes)
-
-		outJSON, err := outRes.String()
-		if err != nil {
-			log.Println("JSON to string error: %v", err)
-			return
-		}
-
-		log.Println("Posting data:", outRes.Headline)
-		err = mqchan.PublishWithContext(ctx,
-			"consent.direct",
-			"datain",
-			false,
-			false,
-			amqp.Publishing{
-				ContentType:"text/json",
-				Body:        []byte(outJSON),
-			},
-		)
-		if err != nil {
-			log.Printf("%s AMQP publish error: %v", outRes.Headline, err)
-			return
-		}
-	}
-
+	
 	currentTime := time.Now().Format("2006-01-02 15:04:05")
 
 	// Scrape results for article links
@@ -218,26 +252,38 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
-			return "", err
+			return events.APIGatewayProxyResponse{
+				StatusCode: 500,
+				Body:       "Unable to create request",
+			}, err
 		}
 		req.AddCookie(cookie)
 		addGHeaders(req)
 
-		res, err := client.Do(req)
+		res, err := getter.httpClient.Do(req)
 		if err != nil {
-			return "", err
+			return events.APIGatewayProxyResponse{
+				StatusCode: 500,
+				Body:       "Unable to get response",
+			}, err
 		}
 		defer res.Body.Close()
 
 		log.Println("Status code:", res.StatusCode)
 		if res.StatusCode == 429 {
 			log.Println("Too many requests")
-			break
+			return events.APIGatewayProxyResponse{
+				StatusCode: 429,
+				Body:       "Too many requests",
+			}, nil
 		}
 
 		doc, err := goquery.NewDocumentFromReader(res.Body)
 		if err != nil {
-			return "", err
+			return events.APIGatewayProxyResponse{
+				StatusCode: 500,
+				Body:       "Unable to parse response",
+			}, err
 		}
 
 		log.Printf("Scraping results for %v", event.Site)
@@ -250,7 +296,7 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 
 			log.Printf("Link: %v", link)
 			wg.Add(1)
-			go handleArticle(DataResponseOut{
+			getter.HandleArticle(DataResponseOut{
 				Datetime: currentTime,
 				Link:     link,
 				Headline: headline,
@@ -268,8 +314,13 @@ func HandleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 		}
 	}
 
+	log.Println("Done.")
+
 	// doneChan <- true
-	return "Done", nil
+	return events.APIGatewayProxyResponse{
+		StatusCode: 200,
+		Body:       "Success!",
+	}, nil
 }
 
 func main() {
